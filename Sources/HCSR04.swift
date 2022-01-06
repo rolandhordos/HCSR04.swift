@@ -2,33 +2,77 @@ import SwiftyGPIO
 import Foundation
 import Dispatch
 
-public class HCSR04 {
-    private let currentlyUsedRaspberryGpios: [GPIOName : GPIO]
-    public var echoConnectedPin: GPIO
-    public var triggerConnectedPin: GPIO
-    public  var maximumSensorRange: Double
-    public enum ErrorList: Error {
-        case echoSignalError //Echo signal error for example disconnected echo, trigger pin or too fast measurments.
-        case measuredDistanceIsOutSensorRange //Measured echo signal is out of sensor range.
-        case userTimeout //User timeout interrupt.
+public enum HCSR04Error: Error {
+    case echoSignalError                                        // check pin connections, timeout, and range
+    case measuredDistanceIsOutSensorRange
+    case userTimeout
+    case unavailableGPIO(detail: String)
+}
+
+/// Create an instance representing the HC-SR04 hardware module
+///
+/// Avoiding *pin* terminology favoring GPIO## as that's what the SwiftyGPIO `.P##` enumeration cases are (vs board pin #).
+/// [Raspberry Pi Pinout](https://www.raspberrypi.com/documentation/computers/os.html#gpio-pinout)
+///
+/// Default maximum distance comes from [the datasheet](https://cdn.sparkfun.com/datasheets/Sensors/Proximity/HCSR04.pdf)
+///
+open class HCSR04 {
+    public typealias CentiMeters = Double
+    
+    public var triggerGPIO    : GPIO?                           // ultrasonic emitter sends first
+    public var echoGPIO       : GPIO?                           // ultrasonic receiver then receives returned sound waves
+    public var maximumDistance: CentiMeters = 400
+
+    /// No-arg constructor, make sure to assign `triggerGPIO` and `echoGPIO` or use optional convenience constructor
+    ///
+    public init() {}
+
+    /// Convenience constructor to perform initialization and configuration in a single step
+    ///
+    /// Treats the instance creation as uncertain, exactly what it is if the GPIOs are not available. Prefers exceptions to fatal errors that kill the
+    /// entire binary, allowing this to be one library in a larger, likely headless system.  Avoids mystery crashes caused by forced unwraps.
+    /// If you can create an instance of something that's misconfigured or will hard crash later with poor description, you don't really have an
+    /// instance you can count on.
+    ///
+    public init?(board: SupportedBoard = .RaspberryPi4, trigger: GPIOName, echo: GPIOName) {
+        do {
+            try configure(board: board, trigger: trigger, echo: echo)
+        } catch {
+            print("Could not stand up an instance of HCSR04 due to: \(error)")
+            return nil
+        }
     }
     
-    public init(usedRaspberry: SupportedBoard, echoConnectedPin: GPIOName, triggerConnectedPin: GPIOName, maximumSensorRange: Double) {
-        self.currentlyUsedRaspberryGpios = SwiftyGPIO.GPIOs(for: usedRaspberry) // Setting gpios for used Raspberry.
-        self.echoConnectedPin = currentlyUsedRaspberryGpios[echoConnectedPin]! //Setting the gpio which the echo pin is conntected to.
-        self.echoConnectedPin.direction = .IN //Setting echo gpio pin direction, always .IN.
-        self.triggerConnectedPin = currentlyUsedRaspberryGpios[triggerConnectedPin]! //Setting the gpio which the trigger pin is conntected to.
-        self.triggerConnectedPin.direction = .OUT //Setting trigger gpio pin direction, always .OUT.
-        self.maximumSensorRange = maximumSensorRange //Setting maximum ultrasonic sensor rage in cm.
+    open func configure (board: SupportedBoard = .RaspberryPi4,
+                         trigger: GPIOName, echo: GPIOName) throws
+    {
+        let gpios = SwiftyGPIO.GPIOs(for: board)
+
+        guard let echoGPIO = gpios[echo] else {
+            throw HCSR04Error.unavailableGPIO(detail: "Echo GPIO number \(echo) not available, check power and wiring")
+        }
+        echoGPIO.direction = .IN
+        
+        guard let triggerGPIO = gpios[trigger] else {
+            throw HCSR04Error.unavailableGPIO(detail: "Trigger GPIO number \(echo) not available, check power and wiring")
+        }
+        triggerGPIO.direction = .OUT
+
+        self.triggerGPIO = triggerGPIO
+        self.echoGPIO = echoGPIO
     }
     
-    public func measureDistance(numberOfSamples: Int? = nil,providedTimeout: Int? = nil) throws -> Double {
+    open func measureDistance(numberOfSamples: Int? = nil, providedTimeout: Int? = nil) throws -> Double {
+        guard let echoGPIO = echoGPIO else {
+            throw HCSR04Error.unavailableGPIO(detail: "Unable to read distance input due to missing echo input GPIO")
+        }
+
         var beginningTimeOfEchoSignal: DispatchTime //The beginning of echo signal.
         var endTimeOfEchoSignal: DispatchTime //The end of echo signal.
         var echoSignalTime = Double.init() //Calculated echo signal time.
         var distance = Double.init() //Calculated distance.
         var enterTimeIntoWhile: DispatchTime //Used for timeout and error detection.
-        let maximumEchoSignalTime = (maximumSensorRange/0.0000343) * 2 //Time of maximum echo signal for provided sensor range - used for error detection and default timeout.
+        let maximumEchoSignalTime = (maximumDistance/0.0000343) * 2 //Time of maximum echo signal for provided sensor range - used for error detection and default timeout.
         let defaultTimeout = maximumEchoSignalTime * 2  //Calculate timeout = (maximumEchoSignalTime)*(safety margin).
         let usedTimeout: Double //Finally used timeout - default or provided by user.
         
@@ -41,23 +85,23 @@ public class HCSR04 {
         for _ in 0..<(numberOfSamples ?? 1) { //Default number of samples is 1, user can provide another number of samples by optional argument while calling method measureDistance
             
             //Start distance measure.
-            generateTriggerImpulse() //Generate trigger impuls 10 microseconds long.
+            try generateTriggerImpulse() //Generate trigger impuls 10 microseconds long.
             
             enterTimeIntoWhile = DispatchTime.now() //Save enter time into while loop for error detection.
-            while (echoConnectedPin.value == 0) {
+            while (echoGPIO.value == 0) {
                 if (calculateTimeInterval(from: enterTimeIntoWhile, to: DispatchTime.now()) > usedTimeout){
-                    throw ErrorList.echoSignalError //Throw error
+                    throw HCSR04Error.echoSignalError //Throw error
                 }
             }
             beginningTimeOfEchoSignal = DispatchTime.now() //Save time of  beginning echo signal.
             
             enterTimeIntoWhile = DispatchTime.now() //Save enter time into while loop for error detection.
-            while (echoConnectedPin.value == 1){ //Wait for end of echo signal.
+            while (echoGPIO.value == 1){ //Wait for end of echo signal.
                 let timeInLoop = calculateTimeInterval(from: enterTimeIntoWhile, to: DispatchTime.now())
                 if timeInLoop >= maximumEchoSignalTime {
-                    throw ErrorList.measuredDistanceIsOutSensorRange //Throw error.
+                    throw HCSR04Error.measuredDistanceIsOutSensorRange //Throw error.
                 } else if (providedTimeout != nil) && (timeInLoop > usedTimeout) {
-                    throw ErrorList.userTimeout //Throw error - user timeout interrupt.
+                    throw HCSR04Error.userTimeout //Throw error - user timeout interrupt.
                 }
             }
             endTimeOfEchoSignal = DispatchTime.now() //Save time of the end echo signal.
@@ -70,18 +114,23 @@ public class HCSR04 {
         }
         distance = distance/Double(numberOfSamples ?? 1) //Calculate average distance.
         
-        if distance <= maximumSensorRange {
+        if distance <= maximumDistance {
             return distance
         } else {
-            throw ErrorList.measuredDistanceIsOutSensorRange
+            throw HCSR04Error.measuredDistanceIsOutSensorRange
         }
     }
     
-    private func generateTriggerImpulse() {
-        triggerConnectedPin.value = 1 //Set trigger pin High level.
-        usleep(10)//Wait 10 microsecodns.
-        triggerConnectedPin.value = 0 //Set trigger pin Low level.
+    open func generateTriggerImpulse() throws {
+        guard let triggerGPIO = triggerGPIO else {
+            throw HCSR04Error.unavailableGPIO(detail: "Unable to trigger sonic impulse due to missing trigger output GPIO")
+        }
+
+        triggerGPIO.value = 1 //Set trigger pin High level.
+        usleep(10)//Wait 10 microseconds.
+        triggerGPIO.value = 0 //Set trigger pin Low level.
     }
+    
     private func calculateTimeInterval(from startTime: DispatchTime, to endTime: DispatchTime) -> Double {
         return Double(endTime.uptimeNanoseconds - startTime.uptimeNanoseconds)
     }
